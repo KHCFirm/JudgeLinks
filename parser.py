@@ -3,10 +3,13 @@ import email
 import imaplib
 import os
 import re
-from datetime import datetime
+import socket
+import ssl
+import sys
 from email.header import decode_header
 from email.message import Message
 from pathlib import Path
+
 from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
 
@@ -25,6 +28,44 @@ CSV_HEADERS = [
     "notes",
     "message_uid",
 ]
+
+
+def mask_secret(value: str, visible: int = 3) -> str:
+    if not value:
+        return "[EMPTY]"
+    if len(value) <= visible * 2:
+        return "*" * len(value)
+    return f"{value[:visible]}...{value[-visible:]} length={len(value)}"
+
+
+def debug_env():
+    print("=== ENV DEBUG ===")
+    print(f"Python: {sys.version}")
+    print(f"IMAP_HOST: {os.environ.get('IMAP_HOST', '[MISSING]')}")
+    print(f"IMAP_USER: {os.environ.get('IMAP_USER', '[MISSING]')}")
+    print(f"IMAP_FOLDER: {os.environ.get('IMAP_FOLDER', '[MISSING]')}")
+    print(f"IMAP_PASSWORD: {mask_secret(os.environ.get('IMAP_PASSWORD', ''))}")
+
+    password = os.environ.get("IMAP_PASSWORD", "")
+    if " " in password:
+        print("WARNING: IMAP_PASSWORD contains spaces. App passwords usually must be pasted without spaces.")
+    if "\n" in password or "\r" in password:
+        print("WARNING: IMAP_PASSWORD contains a newline or carriage return.")
+    print("=================")
+
+
+def test_tcp_connection(host: str, port: int = 993):
+    print(f"Testing TCP SSL connection to {host}:{port}...")
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection((host, port), timeout=20) as sock:
+            with context.wrap_socket(sock, server_hostname=host) as ssock:
+                print(f"SSL connected successfully.")
+                print(f"TLS version: {ssock.version()}")
+                print(f"Cipher: {ssock.cipher()}")
+    except Exception as exc:
+        print(f"TCP/SSL connection failed: {type(exc).__name__}: {exc}")
+        raise
 
 
 def decode_mime_header(value: str) -> str:
@@ -85,6 +126,13 @@ def get_email_body(msg: Message) -> str:
     return ""
 
 
+def clean_url(url: str) -> str:
+    url = url.strip()
+    url = url.rstrip(").,;]")
+    url = url.replace("&amp;", "&")
+    return url
+
+
 def extract_teams_link(text: str) -> str:
     patterns = [
         r"https://teams\.microsoft\.com/[^\s<>\"]+",
@@ -98,13 +146,6 @@ def extract_teams_link(text: str) -> str:
             return clean_url(match.group(0))
 
     return ""
-
-
-def clean_url(url: str) -> str:
-    url = url.strip()
-    url = url.rstrip(").,;]")
-    url = url.replace("&amp;", "&")
-    return url
 
 
 def extract_judge(text: str) -> str:
@@ -208,6 +249,9 @@ def parse_message(uid: str, raw_email: bytes) -> dict:
 
     parsed_status = "Parsed" if not missing else "Needs Review"
 
+    print(f"UID {uid}: subject={subject!r}")
+    print(f"UID {uid}: judge={judge!r}, date={court_date!r}, time={court_time!r}, teams_link_found={bool(teams_link)}")
+
     return {
         "received_at": received_at,
         "email_from": sender,
@@ -223,43 +267,92 @@ def parse_message(uid: str, raw_email: bytes) -> dict:
 
 
 def main():
+    debug_env()
+
     imap_host = os.environ["IMAP_HOST"]
     imap_user = os.environ["IMAP_USER"]
     imap_password = os.environ["IMAP_PASSWORD"]
     imap_folder = os.environ.get("IMAP_FOLDER", "INBOX")
 
+    test_tcp_connection(imap_host)
+
     processed_uids = load_processed_uids()
     ensure_csv_exists()
 
-    mail = imaplib.IMAP4_SSL(imap_host)
-    mail.login(imap_user, imap_password)
-    mail.select(imap_folder)
+    print("Connecting to IMAP server...")
+    mail = imaplib.IMAP4_SSL(imap_host, 993, timeout=30)
 
+    print("Server welcome:")
+    print(mail.welcome)
+
+    print("Requesting server capabilities before login...")
+    try:
+        status, capabilities = mail.capability()
+        print(f"CAPABILITY status: {status}")
+        print(f"CAPABILITY: {capabilities}")
+    except Exception as exc:
+        print(f"Could not fetch capabilities before login: {type(exc).__name__}: {exc}")
+
+    print("Attempting IMAP login...")
+    try:
+        mail.login(imap_user, imap_password)
+        print("LOGIN SUCCESS")
+    except imaplib.IMAP4.error as exc:
+        print("LOGIN FAILED")
+        print(f"Raw IMAP error: {exc}")
+        print("")
+        print("Most common causes:")
+        print("1. App password was pasted with spaces. Remove all spaces.")
+        print("2. IMAP is disabled for this mailbox in Microsoft 365 Admin.")
+        print("3. CourtLinks@KotlarCohen.com is an alias/shared mailbox, not a licensed user mailbox.")
+        print("4. Security Defaults or Conditional Access is still blocking legacy IMAP auth.")
+        print("5. The app password belongs to a different user than IMAP_USER.")
+        raise
+
+    print(f"Selecting folder: {imap_folder!r}")
+    status, folder_data = mail.select(imap_folder)
+    print(f"SELECT status: {status}")
+    print(f"SELECT data: {folder_data}")
+
+    if status != "OK":
+        raise RuntimeError(f"Unable to select mailbox folder: {imap_folder}")
+
+    print("Searching mailbox...")
     status, data = mail.uid("search", None, "ALL")
+    print(f"SEARCH status: {status}")
+
     if status != "OK":
         raise RuntimeError("Unable to search mailbox.")
 
     uids = data[0].decode().split()
+    print(f"Total message count found: {len(uids)}")
+    print(f"Already processed count: {len(processed_uids)}")
+
+    new_count = 0
 
     for uid in uids:
         if uid in processed_uids:
             continue
 
+        print(f"Fetching UID {uid}...")
         status, msg_data = mail.uid("fetch", uid, "(BODY.PEEK[])")
+        print(f"FETCH status for UID {uid}: {status}")
+
         if status != "OK":
+            print(f"Skipping UID {uid}, fetch failed.")
             continue
 
         raw_email = msg_data[0][1]
         row = parse_message(uid, raw_email)
 
-        if row["teams_link"]:
-            append_row(row)
-            save_processed_uid(uid)
-        else:
-            append_row(row)
-            save_processed_uid(uid)
+        append_row(row)
+        save_processed_uid(uid)
+        new_count += 1
+
+    print(f"New messages processed: {new_count}")
 
     mail.logout()
+    print("Done.")
 
 
 if __name__ == "__main__":
