@@ -1,20 +1,15 @@
 import csv
-import email
-import imaplib
 import os
 import re
-import socket
-import ssl
-import sys
-from email.header import decode_header
-from email.message import Message
 from pathlib import Path
+from datetime import datetime, timezone
 
+import requests
 from bs4 import BeautifulSoup
 from dateutil import parser as date_parser
 
 CSV_PATH = Path("data/judge_teams_links.csv")
-PROCESSED_UIDS_PATH = Path("processed_uids.txt")
+PROCESSED_PATH = Path("processed_message_ids.txt")
 
 CSV_HEADERS = [
     "received_at",
@@ -26,114 +21,68 @@ CSV_HEADERS = [
     "teams_link",
     "parsed_status",
     "notes",
-    "message_uid",
+    "message_id",
 ]
 
 
-def mask_secret(value: str, visible: int = 3) -> str:
-    if not value:
-        return "[EMPTY]"
-    if len(value) <= visible * 2:
-        return "*" * len(value)
-    return f"{value[:visible]}...{value[-visible:]} length={len(value)}"
+def ensure_csv_exists():
+    CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not CSV_PATH.exists():
+        with CSV_PATH.open("w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=CSV_HEADERS).writeheader()
 
 
-def debug_env():
-    print("=== ENV DEBUG ===")
-    print(f"Python: {sys.version}")
-    print(f"IMAP_HOST: {os.environ.get('IMAP_HOST', '[MISSING]')}")
-    print(f"IMAP_USER: {os.environ.get('IMAP_USER', '[MISSING]')}")
-    print(f"IMAP_FOLDER: {os.environ.get('IMAP_FOLDER', '[MISSING]')}")
-    print(f"IMAP_PASSWORD: {mask_secret(os.environ.get('IMAP_PASSWORD', ''))}")
-
-    password = os.environ.get("IMAP_PASSWORD", "")
-    if " " in password:
-        print("WARNING: IMAP_PASSWORD contains spaces. App passwords usually must be pasted without spaces.")
-    if "\n" in password or "\r" in password:
-        print("WARNING: IMAP_PASSWORD contains a newline or carriage return.")
-    print("=================")
+def load_processed_ids():
+    if not PROCESSED_PATH.exists():
+        return set()
+    return set(x.strip() for x in PROCESSED_PATH.read_text().splitlines() if x.strip())
 
 
-def test_tcp_connection(host: str, port: int = 993):
-    print(f"Testing TCP SSL connection to {host}:{port}...")
-    try:
-        context = ssl.create_default_context()
-        with socket.create_connection((host, port), timeout=20) as sock:
-            with context.wrap_socket(sock, server_hostname=host) as ssock:
-                print(f"SSL connected successfully.")
-                print(f"TLS version: {ssock.version()}")
-                print(f"Cipher: {ssock.cipher()}")
-    except Exception as exc:
-        print(f"TCP/SSL connection failed: {type(exc).__name__}: {exc}")
-        raise
+def save_processed_id(message_id):
+    with PROCESSED_PATH.open("a", encoding="utf-8") as f:
+        f.write(message_id + "\n")
 
 
-def decode_mime_header(value: str) -> str:
-    if not value:
+def append_row(row):
+    ensure_csv_exists()
+    with CSV_PATH.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+        writer.writerow(row)
+
+
+def get_graph_token():
+    tenant_id = os.environ["TENANT_ID"]
+    client_id = os.environ["CLIENT_ID"]
+    client_secret = os.environ["CLIENT_SECRET"]
+
+    url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+
+    data = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "scope": "https://graph.microsoft.com/.default",
+        "grant_type": "client_credentials",
+    }
+
+    response = requests.post(url, data=data, timeout=30)
+    if not response.ok:
+        print(response.text)
+        response.raise_for_status()
+
+    return response.json()["access_token"]
+
+
+def html_to_text(html):
+    if not html:
         return ""
-
-    parts = decode_header(value)
-    decoded = ""
-
-    for part, encoding in parts:
-        if isinstance(part, bytes):
-            decoded += part.decode(encoding or "utf-8", errors="replace")
-        else:
-            decoded += part
-
-    return decoded.strip()
+    return BeautifulSoup(html, "html.parser").get_text("\n")
 
 
-def get_email_body(msg: Message) -> str:
-    plain_text = ""
-    html_text = ""
-
-    if msg.is_multipart():
-        for part in msg.walk():
-            content_type = part.get_content_type()
-            disposition = str(part.get("Content-Disposition", ""))
-
-            if "attachment" in disposition.lower():
-                continue
-
-            payload = part.get_payload(decode=True)
-            if not payload:
-                continue
-
-            charset = part.get_content_charset() or "utf-8"
-            text = payload.decode(charset, errors="replace")
-
-            if content_type == "text/plain":
-                plain_text += "\n" + text
-            elif content_type == "text/html":
-                html_text += "\n" + text
-    else:
-        payload = msg.get_payload(decode=True)
-        if payload:
-            charset = msg.get_content_charset() or "utf-8"
-            if msg.get_content_type() == "text/html":
-                html_text = payload.decode(charset, errors="replace")
-            else:
-                plain_text = payload.decode(charset, errors="replace")
-
-    if plain_text.strip():
-        return plain_text
-
-    if html_text.strip():
-        soup = BeautifulSoup(html_text, "html.parser")
-        return soup.get_text("\n")
-
-    return ""
+def clean_url(url):
+    return url.strip().rstrip(").,;]").replace("&amp;", "&")
 
 
-def clean_url(url: str) -> str:
-    url = url.strip()
-    url = url.rstrip(").,;]")
-    url = url.replace("&amp;", "&")
-    return url
-
-
-def extract_teams_link(text: str) -> str:
+def extract_teams_link(text):
     patterns = [
         r"https://teams\.microsoft\.com/[^\s<>\"]+",
         r"https://.*?\.teams\.microsoft\.com/[^\s<>\"]+",
@@ -141,32 +90,28 @@ def extract_teams_link(text: str) -> str:
     ]
 
     for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
+        match = re.search(pattern, text, re.I)
         if match:
             return clean_url(match.group(0))
 
     return ""
 
 
-def extract_judge(text: str) -> str:
+def extract_judge(text):
     patterns = [
         r"(?:Judge|Hon\.?|Honorable)\s+([A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,4})",
         r"(?:before|with)\s+(?:Judge|Hon\.?|Honorable)\s+([A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,4})",
     ]
 
     for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
+        match = re.search(pattern, text, re.I)
         if match:
-            judge = match.group(1).strip()
-            judge = re.sub(r"\s+", " ", judge)
-            return judge
+            return re.sub(r"\s+", " ", match.group(1)).strip()
 
     return ""
 
 
-def extract_date_time(text: str):
-    candidates = []
-
+def extract_date_time(text):
     patterns = [
         r"\b\d{1,2}/\d{1,2}/\d{2,4}\s+(?:at\s+)?\d{1,2}:\d{2}\s*(?:AM|PM|A\.M\.|P\.M\.)?\b",
         r"\b\d{1,2}-\d{1,2}-\d{2,4}\s+(?:at\s+)?\d{1,2}:\d{2}\s*(?:AM|PM|A\.M\.|P\.M\.)?\b",
@@ -175,63 +120,59 @@ def extract_date_time(text: str):
     ]
 
     for pattern in patterns:
-        for match in re.finditer(pattern, text, re.IGNORECASE):
-            candidates.append(match.group(0))
-
-    for candidate in candidates:
-        try:
-            parsed = date_parser.parse(candidate, fuzzy=True)
-            court_date = parsed.strftime("%Y-%m-%d")
-            court_time = parsed.strftime("%I:%M %p")
-            return court_date, court_time
-        except Exception:
-            continue
+        matches = re.findall(pattern, text, re.I)
+        for value in matches:
+            if isinstance(value, tuple):
+                value = " ".join(value)
+            try:
+                parsed = date_parser.parse(value, fuzzy=True)
+                return parsed.strftime("%Y-%m-%d"), parsed.strftime("%I:%M %p")
+            except Exception:
+                pass
 
     return "", ""
 
 
-def load_processed_uids() -> set:
-    if not PROCESSED_UIDS_PATH.exists():
-        return set()
+def get_recent_messages(token):
+    mailbox = os.environ["MAILBOX_USER"]
 
-    return {
-        line.strip()
-        for line in PROCESSED_UIDS_PATH.read_text().splitlines()
-        if line.strip()
-    }
+    url = (
+        f"https://graph.microsoft.com/v1.0/users/{mailbox}"
+        "/mailFolders/Inbox/messages"
+        "?$top=25"
+        "&$orderby=receivedDateTime desc"
+        "&$select=id,receivedDateTime,from,subject,body"
+    )
 
+    headers = {"Authorization": f"Bearer {token}"}
 
-def save_processed_uid(uid: str):
-    with PROCESSED_UIDS_PATH.open("a", encoding="utf-8") as file:
-        file.write(uid + "\n")
+    response = requests.get(url, headers=headers, timeout=30)
+    if not response.ok:
+        print(response.text)
+        response.raise_for_status()
 
-
-def ensure_csv_exists():
-    CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    if not CSV_PATH.exists():
-        with CSV_PATH.open("w", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=CSV_HEADERS)
-            writer.writeheader()
+    return response.json().get("value", [])
 
 
-def append_row(row: dict):
-    ensure_csv_exists()
+def parse_message(message):
+    subject = message.get("subject", "") or ""
+    received_at = message.get("receivedDateTime", "") or ""
+    sender = (
+        message.get("from", {})
+        .get("emailAddress", {})
+        .get("address", "")
+    )
 
-    with CSV_PATH.open("a", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=CSV_HEADERS)
-        writer.writerow(row)
+    body_obj = message.get("body", {}) or {}
+    body_content = body_obj.get("content", "") or ""
+    body_type = body_obj.get("contentType", "")
 
+    if body_type.lower() == "html":
+        body_text = html_to_text(body_content)
+    else:
+        body_text = body_content
 
-def parse_message(uid: str, raw_email: bytes) -> dict:
-    msg = email.message_from_bytes(raw_email)
-
-    subject = decode_mime_header(msg.get("Subject", ""))
-    sender = decode_mime_header(msg.get("From", ""))
-    received_at = msg.get("Date", "")
-
-    body = get_email_body(msg)
-    full_text = f"{subject}\n{body}"
+    full_text = f"{subject}\n{body_text}"
 
     teams_link = extract_teams_link(full_text)
     judge = extract_judge(full_text)
@@ -247,11 +188,6 @@ def parse_message(uid: str, raw_email: bytes) -> dict:
     if not teams_link:
         missing.append("Missing Teams Link")
 
-    parsed_status = "Parsed" if not missing else "Needs Review"
-
-    print(f"UID {uid}: subject={subject!r}")
-    print(f"UID {uid}: judge={judge!r}, date={court_date!r}, time={court_time!r}, teams_link_found={bool(teams_link)}")
-
     return {
         "received_at": received_at,
         "email_from": sender,
@@ -260,99 +196,48 @@ def parse_message(uid: str, raw_email: bytes) -> dict:
         "court_date": court_date,
         "court_time": court_time,
         "teams_link": teams_link,
-        "parsed_status": parsed_status,
+        "parsed_status": "Parsed" if not missing else "Needs Review",
         "notes": "; ".join(missing),
-        "message_uid": uid,
+        "message_id": message["id"],
     }
 
 
 def main():
-    debug_env()
-
-    imap_host = os.environ["IMAP_HOST"]
-    imap_user = os.environ["IMAP_USER"]
-    imap_password = os.environ["IMAP_PASSWORD"]
-    imap_folder = os.environ.get("IMAP_FOLDER", "INBOX")
-
-    test_tcp_connection(imap_host)
-
-    processed_uids = load_processed_uids()
     ensure_csv_exists()
 
-    print("Connecting to IMAP server...")
-    mail = imaplib.IMAP4_SSL(imap_host, 993, timeout=30)
+    print("Getting Microsoft Graph token...")
+    token = get_graph_token()
+    print("Token acquired.")
 
-    print("Server welcome:")
-    print(mail.welcome)
+    print("Loading processed message IDs...")
+    processed_ids = load_processed_ids()
 
-    print("Requesting server capabilities before login...")
-    try:
-        status, capabilities = mail.capability()
-        print(f"CAPABILITY status: {status}")
-        print(f"CAPABILITY: {capabilities}")
-    except Exception as exc:
-        print(f"Could not fetch capabilities before login: {type(exc).__name__}: {exc}")
-
-    print("Attempting IMAP login...")
-    try:
-        mail.login(imap_user, imap_password)
-        print("LOGIN SUCCESS")
-    except imaplib.IMAP4.error as exc:
-        print("LOGIN FAILED")
-        print(f"Raw IMAP error: {exc}")
-        print("")
-        print("Most common causes:")
-        print("1. App password was pasted with spaces. Remove all spaces.")
-        print("2. IMAP is disabled for this mailbox in Microsoft 365 Admin.")
-        print("3. CourtLinks@KotlarCohen.com is an alias/shared mailbox, not a licensed user mailbox.")
-        print("4. Security Defaults or Conditional Access is still blocking legacy IMAP auth.")
-        print("5. The app password belongs to a different user than IMAP_USER.")
-        raise
-
-    print(f"Selecting folder: {imap_folder!r}")
-    status, folder_data = mail.select(imap_folder)
-    print(f"SELECT status: {status}")
-    print(f"SELECT data: {folder_data}")
-
-    if status != "OK":
-        raise RuntimeError(f"Unable to select mailbox folder: {imap_folder}")
-
-    print("Searching mailbox...")
-    status, data = mail.uid("search", None, "ALL")
-    print(f"SEARCH status: {status}")
-
-    if status != "OK":
-        raise RuntimeError("Unable to search mailbox.")
-
-    uids = data[0].decode().split()
-    print(f"Total message count found: {len(uids)}")
-    print(f"Already processed count: {len(processed_uids)}")
+    print("Getting recent emails from mailbox...")
+    messages = get_recent_messages(token)
+    print(f"Messages found: {len(messages)}")
 
     new_count = 0
 
-    for uid in uids:
-        if uid in processed_uids:
+    for message in reversed(messages):
+        message_id = message["id"]
+
+        if message_id in processed_ids:
             continue
 
-        print(f"Fetching UID {uid}...")
-        status, msg_data = mail.uid("fetch", uid, "(BODY.PEEK[])")
-        print(f"FETCH status for UID {uid}: {status}")
-
-        if status != "OK":
-            print(f"Skipping UID {uid}, fetch failed.")
-            continue
-
-        raw_email = msg_data[0][1]
-        row = parse_message(uid, raw_email)
-
+        row = parse_message(message)
         append_row(row)
-        save_processed_uid(uid)
+        save_processed_id(message_id)
+
+        print(
+            f"Processed: subject={row['email_subject']!r}, "
+            f"judge={row['judge']!r}, "
+            f"date={row['court_date']!r}, "
+            f"teams_found={bool(row['teams_link'])}"
+        )
+
         new_count += 1
 
     print(f"New messages processed: {new_count}")
-
-    mail.logout()
-    print("Done.")
 
 
 if __name__ == "__main__":
