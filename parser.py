@@ -2,7 +2,6 @@ import csv
 import os
 import re
 from pathlib import Path
-from datetime import datetime, timezone
 
 import requests
 from bs4 import BeautifulSoup
@@ -35,7 +34,7 @@ def ensure_csv_exists():
 def load_processed_ids():
     if not PROCESSED_PATH.exists():
         return set()
-    return set(x.strip() for x in PROCESSED_PATH.read_text().splitlines() if x.strip())
+    return {x.strip() for x in PROCESSED_PATH.read_text().splitlines() if x.strip()}
 
 
 def save_processed_id(message_id):
@@ -46,8 +45,7 @@ def save_processed_id(message_id):
 def append_row(row):
     ensure_csv_exists()
     with CSV_PATH.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_HEADERS)
-        writer.writerow(row)
+        csv.DictWriter(f, fieldnames=CSV_HEADERS).writerow(row)
 
 
 def get_graph_token():
@@ -55,16 +53,17 @@ def get_graph_token():
     client_id = os.environ["CLIENT_ID"]
     client_secret = os.environ["CLIENT_SECRET"]
 
-    url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+    response = requests.post(
+        f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
+        data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "scope": "https://graph.microsoft.com/.default",
+            "grant_type": "client_credentials",
+        },
+        timeout=30,
+    )
 
-    data = {
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "scope": "https://graph.microsoft.com/.default",
-        "grant_type": "client_credentials",
-    }
-
-    response = requests.post(url, data=data, timeout=30)
     if not response.ok:
         print(response.text)
         response.raise_for_status()
@@ -75,7 +74,15 @@ def get_graph_token():
 def html_to_text(html):
     if not html:
         return ""
-    return BeautifulSoup(html, "html.parser").get_text("\n")
+    soup = BeautifulSoup(html, "html.parser")
+    return soup.get_text("\n")
+
+
+def normalize_text(text):
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    return text.strip()
 
 
 def clean_url(url):
@@ -97,21 +104,194 @@ def extract_teams_link(text):
     return ""
 
 
-def extract_judge(text):
+def subject_without_forward_prefix(subject):
+    subject = subject or ""
+    subject = re.sub(r"^(fw|fwd|re):\s*", "", subject.strip(), flags=re.I)
+    return subject.strip()
+
+
+def extract_subject_date(subject):
+    clean_subject = subject_without_forward_prefix(subject)
+
+    match = re.search(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", clean_subject)
+    if not match:
+        return ""
+
+    try:
+        parsed = date_parser.parse(match.group(0), fuzzy=True)
+        return parsed.strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+def get_context_around_teams_link(text):
+    link = extract_teams_link(text)
+    if not link:
+        return text
+
+    index = text.find(link)
+    if index == -1:
+        return text
+
+    start = max(0, index - 800)
+    end = min(len(text), index + len(link) + 1200)
+    return text[start:end]
+
+
+def extract_judge_from_signature(text):
     patterns = [
-        r"(?:Judge|Hon\.?|Honorable)\s+([A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,4})",
-        r"(?:before|with)\s+(?:Judge|Hon\.?|Honorable)\s+([A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,4})",
+        r"\bHon\.?\s+([A-Z][A-Za-z'\-]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][A-Za-z'\-]+){1,3})\b",
+        r"\bHonorable\s+([A-Z][A-Za-z'\-]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][A-Za-z'\-]+){1,3})\b",
     ]
 
     for pattern in patterns:
-        match = re.search(pattern, text, re.I)
-        if match:
-            return re.sub(r"\s+", " ", match.group(1)).strip()
+        matches = list(re.finditer(pattern, text, re.I))
+        for match in matches:
+            name = clean_judge_name(match.group(1))
+            if is_reasonable_judge_name(name):
+                return name
 
     return ""
 
 
-def extract_date_time(text):
+def extract_judge_from_from_header(text):
+    # Handles: From: Prisco, Robert [DOL] <Robert.Prisco@dol.nj.gov>
+    pattern = r"From:\s*([A-Z][A-Za-z'\-]+),\s*([A-Z][A-Za-z'\-]+)(?:\s+[A-Z]\.)?"
+    matches = list(re.finditer(pattern, text))
+
+    for match in matches:
+        last = match.group(1).strip()
+        first = match.group(2).strip()
+        name = f"{first} {last}"
+        if is_reasonable_judge_name(name):
+            return name
+
+    return ""
+
+
+def extract_judge_from_subject(subject):
+    clean_subject = subject_without_forward_prefix(subject)
+
+    # Stops at TEAMS/link/date instead of swallowing the rest of the subject.
+    match = re.search(
+        r"\bJudge\s+(.+?)(?=\s+(?:TEAMS?|Zoom|link|meeting|\d{1,2}/\d{1,2}/\d{2,4})\b|$)",
+        clean_subject,
+        re.I,
+    )
+
+    if match:
+        name = clean_judge_name(match.group(1))
+        if is_reasonable_judge_name(name):
+            return name
+
+    return ""
+
+
+def clean_judge_name(name):
+    name = re.sub(r"\[[^\]]+\]", "", name)
+    name = re.sub(r"\b(TEAMS?|Zoom|link|meeting|court|list)\b.*$", "", name, flags=re.I)
+    name = re.sub(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", "", name)
+    name = re.sub(r"\s+", " ", name)
+    name = name.strip(" ,.-")
+
+    # Keep first, middle initial, last. Drop titles/noise.
+    parts = name.split()
+    filtered = []
+    for part in parts:
+        if part.lower() in {"judge", "hon", "honorable", "teams", "link"}:
+            continue
+        filtered.append(part)
+
+    return " ".join(filtered).strip()
+
+
+def is_reasonable_judge_name(name):
+    if not name:
+        return False
+
+    bad_words = {
+        "teams",
+        "link",
+        "court",
+        "marking",
+        "please",
+        "accept",
+        "following",
+        "sent",
+        "from",
+        "subject",
+        "department",
+    }
+
+    parts = name.split()
+
+    if len(parts) < 2 or len(parts) > 4:
+        return False
+
+    if any(part.lower().strip(".,") in bad_words for part in parts):
+        return False
+
+    if any(re.search(r"\d", part) for part in parts):
+        return False
+
+    return True
+
+
+def extract_judge(subject, text):
+    context = get_context_around_teams_link(text)
+
+    for extractor in [
+        lambda: extract_judge_from_signature(context),
+        lambda: extract_judge_from_from_header(text),
+        lambda: extract_judge_from_subject(subject),
+        lambda: extract_judge_from_signature(text),
+    ]:
+        value = extractor()
+        if value:
+            return value
+
+    return ""
+
+
+def extract_time_near_teams_link(text):
+    context = get_context_around_teams_link(text)
+
+    patterns = [
+        r"\bI\s+start\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?))\b",
+        r"\bstart\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?))\b",
+        r"\bbegin\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?))\b",
+        r"\b(\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?))\b",
+        r"\b(\d{1,2}\s*(?:a\.?m\.?|p\.?m\.?))\b",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, context, re.I)
+        if match:
+            raw_time = match.group(1)
+            try:
+                parsed = date_parser.parse(raw_time, fuzzy=True)
+                return parsed.strftime("%I:%M %p")
+            except Exception:
+                pass
+
+    return ""
+
+
+def extract_date_time(subject, text):
+    court_date = extract_subject_date(subject)
+    court_time = extract_time_near_teams_link(text)
+
+    if court_date or court_time:
+        return court_date, court_time
+
+    # Fallback only. Avoid Sent: dates when possible.
+    cleaned = re.sub(
+        r"Sent:\s*(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?.*?\d{1,2}:\d{2}\s*(AM|PM)",
+        "",
+        text,
+        flags=re.I,
+    )
+
     patterns = [
         r"\b\d{1,2}/\d{1,2}/\d{2,4}\s+(?:at\s+)?\d{1,2}:\d{2}\s*(?:AM|PM|A\.M\.|P\.M\.)?\b",
         r"\b\d{1,2}-\d{1,2}-\d{2,4}\s+(?:at\s+)?\d{1,2}:\d{2}\s*(?:AM|PM|A\.M\.|P\.M\.)?\b",
@@ -120,12 +300,9 @@ def extract_date_time(text):
     ]
 
     for pattern in patterns:
-        matches = re.findall(pattern, text, re.I)
-        for value in matches:
-            if isinstance(value, tuple):
-                value = " ".join(value)
+        for match in re.finditer(pattern, cleaned, re.I):
             try:
-                parsed = date_parser.parse(value, fuzzy=True)
+                parsed = date_parser.parse(match.group(0), fuzzy=True)
                 return parsed.strftime("%Y-%m-%d"), parsed.strftime("%I:%M %p")
             except Exception:
                 pass
@@ -144,9 +321,12 @@ def get_recent_messages(token):
         "&$select=id,receivedDateTime,from,subject,body"
     )
 
-    headers = {"Authorization": f"Bearer {token}"}
+    response = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=30,
+    )
 
-    response = requests.get(url, headers=headers, timeout=30)
     if not response.ok:
         print(response.text)
         response.raise_for_status()
@@ -172,11 +352,12 @@ def parse_message(message):
     else:
         body_text = body_content
 
-    full_text = f"{subject}\n{body_text}"
+    body_text = normalize_text(body_text)
+    full_text = normalize_text(f"{subject}\n{body_text}")
 
     teams_link = extract_teams_link(full_text)
-    judge = extract_judge(full_text)
-    court_date, court_time = extract_date_time(full_text)
+    judge = extract_judge(subject, full_text)
+    court_date, court_time = extract_date_time(subject, full_text)
 
     missing = []
     if not judge:
@@ -209,7 +390,6 @@ def main():
     token = get_graph_token()
     print("Token acquired.")
 
-    print("Loading processed message IDs...")
     processed_ids = load_processed_ids()
 
     print("Getting recent emails from mailbox...")
@@ -232,6 +412,7 @@ def main():
             f"Processed: subject={row['email_subject']!r}, "
             f"judge={row['judge']!r}, "
             f"date={row['court_date']!r}, "
+            f"time={row['court_time']!r}, "
             f"teams_found={bool(row['teams_link'])}"
         )
 
