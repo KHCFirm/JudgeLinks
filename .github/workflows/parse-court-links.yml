@@ -30,7 +30,7 @@ jobs:
           IMAP_USER: ${{ secrets.IMAP_USER }}
           IMAP_PASSWORD: ${{ secrets.IMAP_PASSWORD }}
           IMAP_FOLDER: ${{ secrets.IMAP_FOLDER }}
-        run: python parser.py
+        run: python -u parser.py
 
       - name: Commit CSV updates
         run: |
