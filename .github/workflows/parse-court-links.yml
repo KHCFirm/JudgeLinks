@@ -1,0 +1,41 @@
+name: Parse Judge Teams Links
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  parse-email:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run parser
+        env:
+          IMAP_HOST: ${{ secrets.IMAP_HOST }}
+          IMAP_USER: ${{ secrets.IMAP_USER }}
+          IMAP_PASSWORD: ${{ secrets.IMAP_PASSWORD }}
+          IMAP_FOLDER: ${{ secrets.IMAP_FOLDER }}
+        run: python parser.py
+
+      - name: Commit CSV updates
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add data/judge_teams_links.csv processed_uids.txt
+          git diff --cached --quiet || git commit -m "Update parsed judge Teams links"
+          git push
