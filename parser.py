@@ -1,8 +1,10 @@
 import csv
+import html
 import os
 import re
 from difflib import SequenceMatcher
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -111,14 +113,9 @@ def get_graph_token():
     return response.json()["access_token"]
 
 
-def html_to_text(html):
-    if not html:
-        return ""
-    return BeautifulSoup(html, "html.parser").get_text("\n")
-
-
 def normalize_text(text):
     text = text or ""
+    text = html.unescape(text)
     text = text.replace("\xa0", " ")
     text = text.replace("=92", "'")
     text = text.replace("’", "'")
@@ -129,6 +126,22 @@ def normalize_text(text):
     return text.strip()
 
 
+def html_to_text_with_links(html_content):
+    if not html_content:
+        return "", []
+
+    soup = BeautifulSoup(html_content, "html.parser")
+    text = soup.get_text("\n")
+
+    links = []
+    for tag in soup.find_all("a", href=True):
+        href = html.unescape(tag.get("href", "")).strip()
+        if href:
+            links.append(href)
+
+    return normalize_text(text), links
+
+
 def subject_without_forward_prefix(subject):
     subject = subject or ""
     subject = re.sub(r"^(\s*(fw|fwd|re):\s*)+", "", subject.strip(), flags=re.I)
@@ -137,25 +150,81 @@ def subject_without_forward_prefix(subject):
 
 
 def clean_url(url):
-    return url.strip().rstrip(").,;]").replace("&amp;", "&")
+    url = html.unescape(url or "")
+    url = unquote(url)
+    url = url.strip()
+    url = url.rstrip(").,;]'\">")
+    url = url.replace("&amp;", "&")
+    return url
 
 
-def extract_teams_link(text):
-    patterns = [
+def unwrap_protected_link(url):
+    url = clean_url(url)
+
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+
+    if "url" in query and query["url"]:
+        possible = clean_url(query["url"][0])
+        if "teams.microsoft.com" in possible:
+            return possible
+
+    if "teams.microsoft.com" in url:
+        return url
+
+    return url
+
+
+def extract_teams_link_from_values(values):
+    direct_patterns = [
         r"https://teams\.microsoft\.com/[^\s<>\"]+",
+        r"https://teams\.live\.com/[^\s<>\"]+",
         r"https://.*?\.teams\.microsoft\.com/[^\s<>\"]+",
+        r"https://aka\.ms/[^\s<>\"]+",
     ]
 
-    for pattern in patterns:
-        match = re.search(pattern, text, re.I)
-        if match:
-            return clean_url(match.group(0))
+    for value in values:
+        if not value:
+            continue
+
+        value = html.unescape(str(value))
+        value = unquote(value)
+
+        for pattern in direct_patterns:
+            match = re.search(pattern, value, re.I)
+            if match:
+                found = unwrap_protected_link(match.group(0))
+                if "aka.ms" not in found.lower():
+                    return clean_url(found)
+
+        # Microsoft Safe Links often wrap the real Teams URL in a url= parameter.
+        if "safelinks.protection.outlook.com" in value.lower() or "url=" in value.lower():
+            found = unwrap_protected_link(value)
+            if "teams.microsoft.com" in found.lower():
+                return clean_url(found)
+
+        # Proofpoint / URLDefense format may include the real URL inside the text.
+        if "urldefense" in value.lower() and "teams.microsoft.com" in value.lower():
+            match = re.search(r"https:.*?teams\.microsoft\.com.*", value, re.I)
+            if match:
+                return clean_url(match.group(0))
 
     return ""
 
 
-def get_context_around_teams_link(text):
-    link = extract_teams_link(text)
+def extract_teams_link(full_text, html_links=None, raw_html=""):
+    html_links = html_links or []
+
+    candidates = []
+    candidates.extend(html_links)
+    candidates.append(raw_html)
+    candidates.append(full_text)
+
+    return extract_teams_link_from_values(candidates)
+
+
+def get_context_around_teams_link(text, teams_link=""):
+    link = teams_link or extract_teams_link(text)
     if not link:
         return text
 
@@ -185,7 +254,12 @@ def judge_last_name(judge_name):
 def clean_judge_name(name):
     name = name or ""
     name = re.sub(r"\[[^\]]+\]", "", name)
-    name = re.sub(r"\b(TEAMS?|Zoom|link|meeting|court|list|markings?|listed|settlement|paperwork)\b.*$", "", name, flags=re.I)
+    name = re.sub(
+        r"\b(TEAMS?|Zoom|link|meeting|court|list|markings?|listed|settlement|paperwork)\b.*$",
+        "",
+        name,
+        flags=re.I,
+    )
     name = re.sub(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", "", name)
     name = re.sub(r"\s+", " ", name).strip(" ,.-:")
 
@@ -368,8 +442,8 @@ def extract_judge_from_common_list(text):
     return ""
 
 
-def extract_judge(subject, text):
-    context = get_context_around_teams_link(text)
+def extract_judge(subject, text, teams_link=""):
+    context = get_context_around_teams_link(text, teams_link)
 
     for extractor in [
         lambda: extract_judge_from_dol_header(context),
@@ -457,8 +531,8 @@ def normalize_time_string(raw):
         return ""
 
 
-def extract_time(text):
-    context = get_context_around_teams_link(text)
+def extract_time(text, teams_link=""):
+    context = get_context_around_teams_link(text, teams_link)
 
     patterns = [
         r"\bTEAMS?\s+(\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?))\b",
@@ -495,12 +569,12 @@ def remove_forwarded_sent_lines(text):
     )
 
 
-def extract_date_time(subject, text):
+def extract_date_time(subject, text, teams_link=""):
     court_date = extract_date_from_subject(subject)
     if not court_date:
         court_date = extract_date_from_body(text)
 
-    court_time = extract_time(text)
+    court_time = extract_time(text, teams_link)
 
     cleaned = remove_forwarded_sent_lines(text)
 
@@ -543,14 +617,22 @@ def parse_message(message):
     body_content = body_obj.get("content", "") or ""
     body_type = body_obj.get("contentType", "")
 
-    body_text = html_to_text(body_content) if body_type.lower() == "html" else body_content
-    body_text = normalize_text(body_text)
+    html_links = []
+    raw_html = ""
 
-    full_text = normalize_text(f"{subject}\n{body_text}")
+    if body_type.lower() == "html":
+        raw_html = body_content
+        body_text, html_links = html_to_text_with_links(body_content)
+    else:
+        body_text = normalize_text(body_content)
 
-    teams_link = extract_teams_link(full_text)
-    judge = extract_judge(subject, full_text)
-    court_date, court_time = extract_date_time(subject, full_text)
+    full_text = normalize_text(
+        subject + "\n" + body_text + "\n" + "\n".join(html_links) + "\n" + raw_html
+    )
+
+    teams_link = extract_teams_link(full_text, html_links, raw_html)
+    judge = extract_judge(subject, full_text, teams_link)
+    court_date, court_time = extract_date_time(subject, full_text, teams_link)
 
     missing = []
     if not judge:
