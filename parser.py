@@ -1,6 +1,7 @@
 import csv
 import os
 import re
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import requests
@@ -21,6 +22,51 @@ CSV_HEADERS = [
     "parsed_status",
     "notes",
     "message_id",
+]
+
+COMMON_JUDGES = [
+    "Joseph W. Borucki",
+    "R. Louis Gallagher",
+    "Theresa Yang",
+    "David H. Puma",
+    "Carmine Taglialatella",
+    "Robert Sebera",
+    "Ingrid French",
+    "Elizabeth White",
+    "James Robertson",
+    "David Laporta",
+    "Gerald H Massell",
+    "William Roca",
+    "James Arsenault",
+    "Robert Prisco",
+    "Diana Montes",
+    "Peter J Koulikourdis",
+    "Francis G. Reuss",
+    "Glenn Kaplan",
+    "David R. Puma",
+    "Thomas Capotorto",
+    "Robert Thuring",
+    "Dawn Shanahan",
+    "Neme Akunne",
+    "Tanya Phillips",
+    "Willam Feingold",
+    "Michael Dillon",
+    "Ashley Hutchinson",
+    "Mary H. Casey",
+    "John Rodriguez",
+    "David Lande",
+    "Fred Hopke",
+    "Dana Mayo",
+    "Phillip Laporta",
+    "April Gilmore",
+    "Thomas Smith",
+    "Salvatore Martino",
+    "Walter Schneider",
+    "Bonnie Kass-Viola",
+    "Christopher Leitner",
+    "Brian Eyerman",
+    "Maria Del Valle-Koch",
+    "Diana Ferriero",
 ]
 
 
@@ -49,40 +95,45 @@ def append_row(row):
 
 
 def get_graph_token():
-    tenant_id = os.environ["TENANT_ID"]
-    client_id = os.environ["CLIENT_ID"]
-    client_secret = os.environ["CLIENT_SECRET"]
-
     response = requests.post(
-        f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
+        f"https://login.microsoftonline.com/{os.environ['TENANT_ID']}/oauth2/v2.0/token",
         data={
-            "client_id": client_id,
-            "client_secret": client_secret,
+            "client_id": os.environ["CLIENT_ID"],
+            "client_secret": os.environ["CLIENT_SECRET"],
             "scope": "https://graph.microsoft.com/.default",
             "grant_type": "client_credentials",
         },
         timeout=30,
     )
-
     if not response.ok:
         print(response.text)
         response.raise_for_status()
-
     return response.json()["access_token"]
 
 
 def html_to_text(html):
     if not html:
         return ""
-    soup = BeautifulSoup(html, "html.parser")
-    return soup.get_text("\n")
+    return BeautifulSoup(html, "html.parser").get_text("\n")
 
 
 def normalize_text(text):
+    text = text or ""
     text = text.replace("\xa0", " ")
+    text = text.replace("=92", "'")
+    text = text.replace("’", "'")
+    text = text.replace("–", "-")
+    text = text.replace("—", "-")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n\s*\n+", "\n", text)
     return text.strip()
+
+
+def subject_without_forward_prefix(subject):
+    subject = subject or ""
+    subject = re.sub(r"^(\s*(fw|fwd|re):\s*)+", "", subject.strip(), flags=re.I)
+    subject = subject.replace("[EXTERNAL]", "").strip()
+    return subject
 
 
 def clean_url(url):
@@ -93,7 +144,6 @@ def extract_teams_link(text):
     patterns = [
         r"https://teams\.microsoft\.com/[^\s<>\"]+",
         r"https://.*?\.teams\.microsoft\.com/[^\s<>\"]+",
-        r"https://www\.microsoft\.com/.+?teams[^\s<>\"]+",
     ]
 
     for pattern in patterns:
@@ -104,105 +154,48 @@ def extract_teams_link(text):
     return ""
 
 
-def subject_without_forward_prefix(subject):
-    subject = subject or ""
-    subject = re.sub(r"^(fw|fwd|re):\s*", "", subject.strip(), flags=re.I)
-    return subject.strip()
-
-
-def extract_subject_date(subject):
-    clean_subject = subject_without_forward_prefix(subject)
-
-    match = re.search(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", clean_subject)
-    if not match:
-        return ""
-
-    try:
-        parsed = date_parser.parse(match.group(0), fuzzy=True)
-        return parsed.strftime("%Y-%m-%d")
-    except Exception:
-        return ""
-
-
 def get_context_around_teams_link(text):
     link = extract_teams_link(text)
     if not link:
         return text
 
-    index = text.find(link)
-    if index == -1:
+    idx = text.find(link)
+    if idx == -1:
         return text
 
-    start = max(0, index - 800)
-    end = min(len(text), index + len(link) + 1200)
-    return text[start:end]
+    return text[max(0, idx - 2500): min(len(text), idx + len(link) + 2500)]
 
 
-def extract_judge_from_signature(text):
-    patterns = [
-        r"\bHon\.?\s+([A-Z][A-Za-z'\-]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][A-Za-z'\-]+){1,3})\b",
-        r"\bHonorable\s+([A-Z][A-Za-z'\-]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][A-Za-z'\-]+){1,3})\b",
-    ]
-
-    for pattern in patterns:
-        matches = list(re.finditer(pattern, text, re.I))
-        for match in matches:
-            name = clean_judge_name(match.group(1))
-            if is_reasonable_judge_name(name):
-                return name
-
-    return ""
+def normalize_name_for_match(value):
+    value = value.lower()
+    value = re.sub(r"\bjudge\b", "", value)
+    value = re.sub(r"\bhonorable\b", "", value)
+    value = re.sub(r"\bhon\b", "", value)
+    value = re.sub(r"[^a-z\s]", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
 
 
-def extract_judge_from_from_header(text):
-    # Handles: From: Prisco, Robert [DOL] <Robert.Prisco@dol.nj.gov>
-    pattern = r"From:\s*([A-Z][A-Za-z'\-]+),\s*([A-Z][A-Za-z'\-]+)(?:\s+[A-Z]\.)?"
-    matches = list(re.finditer(pattern, text))
-
-    for match in matches:
-        last = match.group(1).strip()
-        first = match.group(2).strip()
-        name = f"{first} {last}"
-        if is_reasonable_judge_name(name):
-            return name
-
-    return ""
-
-
-def extract_judge_from_subject(subject):
-    clean_subject = subject_without_forward_prefix(subject)
-
-    # Stops at TEAMS/link/date instead of swallowing the rest of the subject.
-    match = re.search(
-        r"\bJudge\s+(.+?)(?=\s+(?:TEAMS?|Zoom|link|meeting|\d{1,2}/\d{1,2}/\d{2,4})\b|$)",
-        clean_subject,
-        re.I,
-    )
-
-    if match:
-        name = clean_judge_name(match.group(1))
-        if is_reasonable_judge_name(name):
-            return name
-
-    return ""
+def judge_last_name(judge_name):
+    clean = normalize_name_for_match(judge_name)
+    parts = clean.split()
+    return parts[-1] if parts else ""
 
 
 def clean_judge_name(name):
+    name = name or ""
     name = re.sub(r"\[[^\]]+\]", "", name)
-    name = re.sub(r"\b(TEAMS?|Zoom|link|meeting|court|list)\b.*$", "", name, flags=re.I)
+    name = re.sub(r"\b(TEAMS?|Zoom|link|meeting|court|list|markings?|listed|settlement|paperwork)\b.*$", "", name, flags=re.I)
     name = re.sub(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", "", name)
-    name = re.sub(r"\s+", " ", name)
-    name = name.strip(" ,.-")
+    name = re.sub(r"\s+", " ", name).strip(" ,.-:")
 
-    # Keep first, middle initial, last. Drop titles/noise.
-    parts = name.split()
-    filtered = []
-    for part in parts:
-        if part.lower() in {"judge", "hon", "honorable", "teams", "link"}:
+    parts = []
+    for part in name.split():
+        if part.lower().strip(".") in {"judge", "hon", "honorable", "your", "honor"}:
             continue
-        filtered.append(part)
+        parts.append(part)
 
-    return " ".join(filtered).strip()
+    return " ".join(parts).strip()
 
 
 def is_reasonable_judge_name(name):
@@ -210,22 +203,15 @@ def is_reasonable_judge_name(name):
         return False
 
     bad_words = {
-        "teams",
-        "link",
-        "court",
-        "marking",
-        "please",
-        "accept",
-        "following",
-        "sent",
-        "from",
-        "subject",
-        "department",
+        "teams", "link", "court", "marking", "markings", "please", "accept",
+        "following", "sent", "from", "subject", "department", "microsoft",
+        "meeting", "listed", "settlement", "paperwork", "conference", "today",
+        "tomorrow", "dear", "your", "honor"
     }
 
     parts = name.split()
 
-    if len(parts) < 2 or len(parts) > 4:
+    if len(parts) < 1 or len(parts) > 4:
         return False
 
     if any(part.lower().strip(".,") in bad_words for part in parts):
@@ -237,77 +223,291 @@ def is_reasonable_judge_name(name):
     return True
 
 
+def normalize_judge_name(candidate):
+    candidate = clean_judge_name(candidate)
+    if not candidate:
+        return ""
+
+    candidate_norm = normalize_name_for_match(candidate)
+    candidate_parts = candidate_norm.split()
+
+    if not candidate_parts:
+        return ""
+
+    candidate_last = candidate_parts[-1]
+
+    best_name = ""
+    best_score = 0
+
+    for judge in COMMON_JUDGES:
+        judge_norm = normalize_name_for_match(judge)
+        score = SequenceMatcher(None, candidate_norm, judge_norm).ratio()
+
+        if score > best_score:
+            best_score = score
+            best_name = judge
+
+    if best_score >= 0.82:
+        return best_name
+
+    matches = [
+        judge for judge in COMMON_JUDGES
+        if judge_last_name(judge) == candidate_last
+    ]
+
+    if len(matches) == 1:
+        return matches[0]
+
+    if len(candidate_parts) >= 2:
+        first = candidate_parts[0]
+        last = candidate_parts[-1]
+
+        matches = [
+            judge for judge in COMMON_JUDGES
+            if normalize_name_for_match(judge).split()[0] == first
+            and judge_last_name(judge) == last
+        ]
+
+        if len(matches) == 1:
+            return matches[0]
+
+    return candidate
+
+
+def extract_judge_from_subject(subject):
+    clean_subject = subject_without_forward_prefix(subject)
+
+    patterns = [
+        r"\bJudge\s+(.+?)(?=\s*[-,]|\s+(?:TEAMS?|Zoom|link|meeting|\d{1,2}/\d{1,2}/\d{2,4}|Monday|Tuesday|Wednesday|Thursday|Friday)\b|$)",
+        r"^([A-Z][a-zA-Z'\-]+)\s*[-,]\s*#?\d",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, clean_subject, re.I)
+        if match:
+            name = clean_judge_name(match.group(1))
+            if is_reasonable_judge_name(name):
+                return normalize_judge_name(name)
+
+    return ""
+
+
+def extract_judge_from_dol_header(text):
+    patterns = [
+        r"From:\s*([A-Z][A-Za-z'\-]+),\s*([A-Z][A-Za-z'\-]+)(?:\s+[A-Z]\.)?\s*\[DOL\]",
+        r"To:\s*([A-Z][A-Za-z'\-]+),\s*([A-Z][A-Za-z'\-]+)(?:\s+[A-Z]\.)?\s*\[DOL\]",
+        r"From:\s*([A-Z][A-Za-z'\-]+),\s*([A-Z][A-Za-z'\-]+).*?@dol\.nj\.gov",
+        r"To:\s*([A-Z][A-Za-z'\-]+),\s*([A-Z][A-Za-z'\-]+).*?@dol\.nj\.gov",
+    ]
+
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.I):
+            name = f"{match.group(2)} {match.group(1)}"
+            if is_reasonable_judge_name(name):
+                return normalize_judge_name(name)
+
+    return ""
+
+
+def extract_judge_from_email_address(text):
+    pattern = r"\b([A-Z][A-Za-z]+)\.([A-Z][A-Za-z]+)@dol\.nj\.gov\b"
+
+    for match in re.finditer(pattern, text, re.I):
+        name = f"{match.group(1)} {match.group(2)}"
+        if is_reasonable_judge_name(name):
+            return normalize_judge_name(name)
+
+    return ""
+
+
+def extract_judge_from_signature(text):
+    patterns = [
+        r"\bHon\.?\s+([A-Z][A-Za-z'\-]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][A-Za-z'\-]+){0,3})\b",
+        r"\bHonorable\s+([A-Z][A-Za-z'\-]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][A-Za-z'\-]+){0,3})\b",
+        r"\bJudge\s+([A-Z][A-Za-z'\-]+(?:\s+[A-Z]\.)?(?:\s+[A-Z][A-Za-z'\-]+){0,3})\b",
+    ]
+
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.I):
+            name = clean_judge_name(match.group(1))
+            if is_reasonable_judge_name(name):
+                return normalize_judge_name(name)
+
+    return ""
+
+
+def extract_judge_from_dear_line(text):
+    patterns = [
+        r"\bDear\s+Judge\s+([A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+)?)\b",
+        r"\bDear\s+Hon\.?\s+([A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+)?)\b",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            name = clean_judge_name(match.group(1))
+            if is_reasonable_judge_name(name):
+                return normalize_judge_name(name)
+
+    return ""
+
+
+def extract_judge_from_common_list(text):
+    text_norm = normalize_name_for_match(text)
+
+    for judge in COMMON_JUDGES:
+        judge_norm = normalize_name_for_match(judge)
+        last = judge_last_name(judge)
+
+        if judge_norm and judge_norm in text_norm:
+            return judge
+
+        if last and re.search(rf"\bjudge\s+{re.escape(last)}\b", text, re.I):
+            return judge
+
+    return ""
+
+
 def extract_judge(subject, text):
     context = get_context_around_teams_link(text)
 
     for extractor in [
+        lambda: extract_judge_from_dol_header(context),
+        lambda: extract_judge_from_email_address(context),
         lambda: extract_judge_from_signature(context),
-        lambda: extract_judge_from_from_header(text),
         lambda: extract_judge_from_subject(subject),
+        lambda: extract_judge_from_dear_line(text),
+        lambda: extract_judge_from_common_list(context),
+        lambda: extract_judge_from_dol_header(text),
+        lambda: extract_judge_from_email_address(text),
         lambda: extract_judge_from_signature(text),
+        lambda: extract_judge_from_common_list(text),
     ]:
         value = extractor()
         if value:
-            return value
+            return normalize_judge_name(value)
 
     return ""
 
 
-def extract_time_near_teams_link(text):
-    context = get_context_around_teams_link(text)
+def parse_date_value(raw_date):
+    try:
+        parsed = date_parser.parse(raw_date, fuzzy=True)
+        return parsed.strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+def extract_date_from_subject(subject):
+    clean_subject = subject_without_forward_prefix(subject)
 
     patterns = [
-        r"\bI\s+start\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?))\b",
-        r"\bstart\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?))\b",
-        r"\bbegin\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?))\b",
-        r"\b(\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?))\b",
-        r"\b(\d{1,2}\s*(?:a\.?m\.?|p\.?m\.?))\b",
+        r"\b\d{1,2}/\d{1,2}/\d{2,4}\b",
+        r"\b(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b",
+        r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}\b",
     ]
 
     for pattern in patterns:
-        match = re.search(pattern, context, re.I)
+        match = re.search(pattern, clean_subject, re.I)
         if match:
-            raw_time = match.group(1)
-            try:
-                parsed = date_parser.parse(raw_time, fuzzy=True)
-                return parsed.strftime("%I:%M %p")
-            except Exception:
-                pass
+            value = parse_date_value(match.group(0))
+            if value:
+                return value
 
     return ""
 
 
-def extract_date_time(subject, text):
-    court_date = extract_subject_date(subject)
-    court_time = extract_time_near_teams_link(text)
+def extract_date_from_body(text):
+    patterns = [
+        r"\b(?:listed|list|calendar of|for your list on|for your)\s*:?\s*(?:#\d+\s*[-]\s*)?((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4})",
+        r"\b((?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4})\b",
+        r"\b(?:for|listing|listed|markings|calendar)\s+(?:the\s+)?(\d{1,2}/\d{1,2}/\d{2,4})\b",
+        r"\b(\d{1,2}/\d{1,2}/\d{2,4})\s+(?:court\s+)?(?:list|listing|markings)\b",
+    ]
 
-    if court_date or court_time:
-        return court_date, court_time
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.I):
+            raw = match.group(1)
+            value = parse_date_value(raw)
+            if value:
+                return value
 
-    # Fallback only. Avoid Sent: dates when possible.
-    cleaned = re.sub(
+    return ""
+
+
+def normalize_time_string(raw):
+    raw = raw.lower().strip()
+    raw = raw.replace(".", "")
+    raw = re.sub(r"\s+", " ", raw)
+
+    match = re.fullmatch(r"(\d{1,2})(\d{2})", raw)
+    if match:
+        raw = f"{match.group(1)}:{match.group(2)} am"
+
+    if re.fullmatch(r"\d{1,2}", raw):
+        raw = f"{raw}:00 am"
+
+    if re.fullmatch(r"\d{1,2}\s*(am|pm)", raw):
+        raw = re.sub(r"(\d{1,2})\s*(am|pm)", r"\1:00 \2", raw)
+
+    try:
+        parsed = date_parser.parse(raw, fuzzy=True)
+        return parsed.strftime("%I:%M %p")
+    except Exception:
+        return ""
+
+
+def extract_time(text):
+    context = get_context_around_teams_link(text)
+
+    patterns = [
+        r"\bTEAMS?\s+(\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?))\b",
+        r"\bconference\s+(\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?))\b",
+        r"\btestimony\s+(?:is\s+scheduled\s+)?(?:in-person\s+)?(?:at\s+)?(\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?)\b",
+        r"\btestimony\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?)\b",
+        r"\bset\s+me\s+up\s+on\s+Monday\s+at\s+(\d{3,4})\b",
+        r"\bon\s+Monday\s+at\s+(\d{3,4})\b",
+        r"\bMonday\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)?)\b",
+        r"\brecord\s+Monday\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?))\b",
+        r"\bI\s+start\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?))\b",
+        r"\b(?:start|begin)\s+at\s+(\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?))\b",
+        r"\bat\s+(\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?))\b",
+        r"\b(\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?))\b",
+    ]
+
+    for search_area in [context, text]:
+        for pattern in patterns:
+            match = re.search(pattern, search_area, re.I)
+            if match:
+                value = normalize_time_string(match.group(1))
+                if value:
+                    return value
+
+    return ""
+
+
+def remove_forwarded_sent_lines(text):
+    return re.sub(
         r"Sent:\s*(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?.*?\d{1,2}:\d{2}\s*(AM|PM)",
         "",
         text,
         flags=re.I,
     )
 
-    patterns = [
-        r"\b\d{1,2}/\d{1,2}/\d{2,4}\s+(?:at\s+)?\d{1,2}:\d{2}\s*(?:AM|PM|A\.M\.|P\.M\.)?\b",
-        r"\b\d{1,2}-\d{1,2}-\d{2,4}\s+(?:at\s+)?\d{1,2}:\d{2}\s*(?:AM|PM|A\.M\.|P\.M\.)?\b",
-        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\s+(?:at\s+)?\d{1,2}:\d{2}\s*(?:AM|PM|A\.M\.|P\.M\.)?\b",
-        r"\b\d{1,2}/\d{1,2}/\d{2,4}\b",
-    ]
 
-    for pattern in patterns:
-        for match in re.finditer(pattern, cleaned, re.I):
-            try:
-                parsed = date_parser.parse(match.group(0), fuzzy=True)
-                return parsed.strftime("%Y-%m-%d"), parsed.strftime("%I:%M %p")
-            except Exception:
-                pass
+def extract_date_time(subject, text):
+    court_date = extract_date_from_subject(subject)
+    if not court_date:
+        court_date = extract_date_from_body(text)
 
-    return "", ""
+    court_time = extract_time(text)
+
+    cleaned = remove_forwarded_sent_lines(text)
+
+    if not court_date:
+        court_date = extract_date_from_body(cleaned)
+
+    return court_date, court_time
 
 
 def get_recent_messages(token):
@@ -337,22 +537,15 @@ def get_recent_messages(token):
 def parse_message(message):
     subject = message.get("subject", "") or ""
     received_at = message.get("receivedDateTime", "") or ""
-    sender = (
-        message.get("from", {})
-        .get("emailAddress", {})
-        .get("address", "")
-    )
+    sender = message.get("from", {}).get("emailAddress", {}).get("address", "")
 
     body_obj = message.get("body", {}) or {}
     body_content = body_obj.get("content", "") or ""
     body_type = body_obj.get("contentType", "")
 
-    if body_type.lower() == "html":
-        body_text = html_to_text(body_content)
-    else:
-        body_text = body_content
-
+    body_text = html_to_text(body_content) if body_type.lower() == "html" else body_content
     body_text = normalize_text(body_text)
+
     full_text = normalize_text(f"{subject}\n{body_text}")
 
     teams_link = extract_teams_link(full_text)
